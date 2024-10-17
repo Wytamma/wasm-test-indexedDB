@@ -43,7 +43,7 @@
     let CLI = await new Aioli({
           tool: "minimap2-simd",
           version: "2.22",
-          urlPrefix: `${window.location.origin}/tools/minimap2`,
+          urlPrefix: `${window.location.href}/tools/minimap2`,
           features: {simd: true},
           reinit: false,
       }, {
