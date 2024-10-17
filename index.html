@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minimap2 with Reads and Reference Inputs</title>
+  <script src="tools/aioli.js"></script>
+</head>
+<body>
+
+  <h1>Minimap2 with Aioli and IndexedDB</h1>
+  
+  <!-- Input for reference genome file -->
+  <label for="referenceInput">Reference Genome:</label>
+  <input type="file" id="referenceInput"><br><br>
+  
+  <!-- Input for reads files (can be multiple) -->
+  <label for="readsInput">Reads File(s):</label>
+  <input type="file" id="readsInput" multiple><br><br>
+
+  <!-- Button to download the output -->
+  <button id="downloadButton" disabled>Download Minimap2 Output</button>
+  <p id="status"></p>
+
+  <script type="module">
+    const CHUNK_SIZE_LIMIT = 50 * 1024 * 1024; // 50MB size limit
+    let outputBuffer = []; // Buffer to accumulate data
+    let bufferSize = 0; // Current buffer size
+
+    // Flush queue to manage flush requests
+    let flushQueue = [];
+    let flushing = false; // Flag to indicate if a flush is in progress
+    let processCompleted = false; // Flag to indicate if the process has completed
+    let callback = async (output) => {
+      if (output.stdout) {
+        await accumulateOutput(output.stdout + '\n');
+      } else if (output.stderr) {
+        document.getElementById('status').textContent = output.stderr;
+        console.info(output.stderr);
+      }
+    };
+    // Initialize Aioli with minimap2
+    let CLI = await new Aioli({
+          tool: "minimap2-simd",
+          version: "2.22",
+          urlPrefix: `${window.location.origin}/tools/minimap2`,
+          features: {simd: true},
+          reinit: false,
+      }, {
+        debug: true,
+        printInterleaved: false,
+        printStream: true,
+        callback: callback,
+      });
+      console.log(CLI.config)
+
+    // Open IndexedDB for storing streamed minimap2 output
+    async function openIndexedDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open('Minimap2OutputDB', 1);
+
+        request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+          db.createObjectStore('outputChunks', { keyPath: 'id', autoIncrement: true });
+        };
+
+        request.onsuccess = (event) => resolve(event.target.result);
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+
+    // Clear IndexedDB to start fresh
+    async function clearIndexedDB() {
+      const db = await openIndexedDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(['outputChunks'], 'readwrite');
+        const store = transaction.objectStore('outputChunks');
+        const clearRequest = store.clear();
+
+        clearRequest.onsuccess = () => resolve();
+        clearRequest.onerror = (event) => reject(event.target.error);
+      });
+    }
+
+    // Add flush request to the queue and process them one at a time
+    async function flushBufferToIndexedDB(db) {
+      if (bufferSize === 0) {
+        return;
+      }
+
+      // Add flush request to the queue (make a copy of the buffer)
+      flushQueue.push({ db, buffer: outputBuffer.slice(), size: bufferSize });
+      
+      // Immediately reset buffer and bufferSize to prevent duplicate flushing
+      bufferSize = 0;
+      outputBuffer = [];
+      
+      // Process the flush queue
+      await processFlushQueue();
+    }
+
+    // Process the flush queue one item at a time
+    async function processFlushQueue() {
+      if (flushing || flushQueue.length === 0) return; // Exit if a flush is in progress or the queue is empty
+
+      flushing = true; // Lock the flush process
+
+      while (flushQueue.length > 0) {
+        const { db, buffer, size } = flushQueue.shift(); // Get the first item in the queue
+
+        if (buffer.length > 0) {
+          const chunk = new Blob(buffer, { type: 'text/plain' });
+          await storeOutputChunk(db, chunk);
+        }
+      }
+
+      flushing = false; // Unlock the flush process
+
+      // If process has completed and queue is empty, handle the final flush
+      if (processCompleted && flushQueue.length === 0) {
+        document.getElementById('status').textContent = 'Minimap2 processing completed. You can now download the output.';
+        document.getElementById('downloadButton').disabled = false;
+      }
+    }
+
+    // Store streamed output chunk in IndexedDB when buffer exceeds 50MB
+    async function storeOutputChunk(db, chunk) {
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(['outputChunks'], 'readwrite');
+        const store = transaction.objectStore('outputChunks');
+        const request = store.add({ chunk });
+
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+
+    // Handle accumulating data in 50MB blocks
+    async function accumulateOutput(output) {
+      outputBuffer.push(output);
+      bufferSize += output.length;
+      const memoryUsage = performance.memory.usedJSHeapSize / (1024 * 1024);
+      document.getElementById('status').textContent = `Buffer size: ${bufferSize} bytes | Memory usage: ${memoryUsage.toFixed(2)} MB`;
+      if (bufferSize >= CHUNK_SIZE_LIMIT) {
+        const db = await openIndexedDB();
+        await flushBufferToIndexedDB(db);
+      }
+    }
+
+    // Retrieve chunks from IndexedDB and stream to a Blob
+    async function streamChunksToBlob() {
+      const db = await openIndexedDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(['outputChunks'], 'readonly');
+        const store = transaction.objectStore('outputChunks');
+        const request = store.openCursor();
+
+        const chunks = [];
+        request.onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (cursor) {
+            chunks.push(cursor.value.chunk);  // Collect chunk
+            cursor.continue();  // Move to the next chunk
+          } else {
+            // All chunks retrieved, create a Blob
+            const blob = new Blob(chunks, { type: 'text/plain' });
+            resolve(blob);
+          }
+        };
+
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+
+    // Initialize Aioli with minimap2 and handle file input for reference and reads
+    async function initAioliAndRunMinimap2(referenceFile, readsFiles) {
+      document.getElementById('status').textContent = 'Initializing minimap2 and running...';
+
+      // Clear previous output in IndexedDB
+      await clearIndexedDB();
+
+      // Mount the reference file
+      const referencePath = await CLI.mount([referenceFile]);
+      // Mount the reads files (can be multiple)
+      const readsPaths = await CLI.mount(readsFiles);
+
+      // Run minimap2: -a option aligns the reads to the reference genome
+      const minimapCommand = `minimap2 -a ${referencePath[0]} ${readsPaths.join(' ')}`;
+      let result = await CLI.exec(minimapCommand);
+      console.log(result);
+      // Mark process as completed and trigger the final flush
+      processCompleted = true;
+      const db = await openIndexedDB();
+      await flushBufferToIndexedDB(db);
+    }
+
+    document.getElementById('referenceInput').addEventListener('change', async (event) => {
+      document.getElementById('downloadButton').disabled = true;
+    });
+
+    // Handle file input for both reference and reads
+    document.getElementById('readsInput').addEventListener('change', async (event) => {
+      const referenceFile = document.getElementById('referenceInput').files[0];
+      const readsFiles = document.getElementById('readsInput').files;
+
+      document.getElementById('downloadButton').disabled = true;
+
+      if (referenceFile && readsFiles.length > 0) {
+        await initAioliAndRunMinimap2(referenceFile, readsFiles);
+      } else {
+        document.getElementById('status').textContent = 'Please upload both reference and reads files.';
+      }
+    });
+
+    // Download the processed minimap2 output
+    document.getElementById('downloadButton').addEventListener('click', async () => {
+      const blob = await streamChunksToBlob();
+      
+      // Create a link to download the Blob
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'minimap2_output.txt';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    });
+    console.log("Minimap2 with Aioli and IndexedDB initialized.");
+    //Check if db exists and contains a file
+    const db = await openIndexedDB();
+    // console.log(db);
+    if (db) {
+      const transaction = db.transaction(['outputChunks'], 'readonly');
+      const store = transaction.objectStore('outputChunks');
+      const countRequest = store.count();
+      countRequest.onsuccess = function() {
+        if (countRequest.result > 0) {
+          document.getElementById('status').textContent = 'IndexedDB contains previous output. Ready for new processing.';
+          document.getElementById('downloadButton').disabled = false;
+        } else {
+          document.getElementById('status').textContent = 'IndexedDB cleared. Ready for new processing.';
+        }
+      };
+    }
+  </script>
+
+</body>
+</html>
